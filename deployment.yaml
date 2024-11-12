@@ -1,0 +1,183 @@
+---
+- name: Deploy Portainer, Heimdall, and WordPress with NGINX SSL reverse proxy
+  hosts: debian_servers
+  become: true
+  vars:
+    # Define ports and credentials
+    portainer_port: 9443
+    heimdall_port: 7443
+    wordpress_port: 8443
+    db_root_password: "wordpress_db_password"
+    db_name: "wordpress"
+    db_user: "wp_user"
+    db_password: "wp_password"
+    
+    # Paths for SSL certificates
+    ssl_cert_path: "/etc/nginx/ssl"
+    ssl_cert: "{{ ssl_cert_path }}/server.crt"
+    ssl_key: "{{ ssl_cert_path }}/server.key"
+
+    # Backup paths
+    backup_path: "/opt/backups"
+    cron_backup_time: "0 3 * * *"  # Daily at 3 AM
+
+  tasks:
+    - name: Update apt and install prerequisites
+      apt:
+        update_cache: yes
+        name: "{{ item }}"
+        state: present
+      loop:
+        - apt-transport-https
+        - ca-certificates
+        - curl
+        - gnupg
+        - lsb-release
+
+    - name: Add Docker’s official GPG key
+      ansible.builtin.apt_key:
+        url: https://download.docker.com/linux/debian/gpg
+        state: present
+
+    - name: Set up the Docker repository
+      ansible.builtin.apt_repository:
+        repo: "deb [arch=amd64] https://download.docker.com/linux/debian {{ ansible_distribution_release }} stable"
+        state: present
+
+    - name: Install Docker and NGINX
+      apt:
+        name:
+          - docker-ce
+          - nginx
+        state: present
+        update_cache: yes
+
+    - name: Install Docker Compose
+      ansible.builtin.get_url:
+        url: "https://github.com/docker/compose/releases/download/1.29.2/docker-compose-$(uname -s)-$(uname -m)"
+        dest: /usr/local/bin/docker-compose
+        mode: '0755'
+
+    - name: Start and enable Docker service
+      ansible.builtin.systemd:
+        name: docker
+        enabled: true
+        state: started
+
+    - name: Install Portainer natively on the host
+      shell: |
+        curl -fsSL https://downloads.portainer.io/agent/portainer-installer.sh | bash -s -- -p {{ portainer_port }}
+      args:
+        creates: /etc/systemd/system/portainer.service
+
+    - name: Start and enable Portainer service
+      ansible.builtin.systemd:
+        name: portainer
+        enabled: true
+        state: started
+
+    - name: Deploy Heimdall on port {{ heimdall_port }}
+      ansible.builtin.docker_container:
+        name: heimdall
+        image: linuxserver/heimdall:latest
+        ports:
+          - "{{ heimdall_port }}:7443"
+        volumes:
+          - heimdall_data:/config
+        environment:
+          - PUID=1000
+          - PGID=1000
+        restart_policy: always
+
+    - name: Deploy MariaDB container for WordPress
+      ansible.builtin.docker_container:
+        name: wordpress_db
+        image: mariadb:latest
+        environment:
+          MYSQL_ROOT_PASSWORD: "{{ db_root_password }}"
+          MYSQL_DATABASE: "{{ db_name }}"
+          MYSQL_USER: "{{ db_user }}"
+          MYSQL_PASSWORD: "{{ db_password }}"
+        volumes:
+          - wordpress_db_data:/var/lib/mysql
+        restart_policy: always
+
+    - name: Deploy WordPress on port {{ wordpress_port }}
+      ansible.builtin.docker_container:
+        name: wordpress
+        image: wordpress:latest
+        ports:
+          - "{{ wordpress_port }}:8443"
+        environment:
+          WORDPRESS_DB_HOST: wordpress_db
+          WORDPRESS_DB_NAME: "{{ db_name }}"
+          WORDPRESS_DB_USER: "{{ db_user }}"
+          WORDPRESS_DB_PASSWORD: "{{ db_password }}"
+        volumes:
+          - wordpress_data:/var/www/html
+        depends_on:
+          - wordpress_db
+        restart_policy: always
+
+    - name: Create directory for SSL certificates
+      ansible.builtin.file:
+        path: "{{ ssl_cert_path }}"
+        state: directory
+        mode: '0755'
+
+    - name: Generate a self-signed SSL certificate
+      ansible.builtin.command: >
+        openssl req -x509 -nodes -days 365 -newkey rsa:2048
+        -keyout {{ ssl_key }} -out {{ ssl_cert }}
+        -subj "/C=US/ST=State/L=City/O=Organization/OU=Department/CN=example.com"
+      args:
+        creates: "{{ ssl_cert }}"
+
+    - name: Configure NGINX as a reverse proxy with SSL
+      template:
+        src: nginx_reverse_proxy.j2
+        dest: /etc/nginx/sites-available/reverse_proxy
+      notify: restart nginx
+
+    - name: Enable NGINX reverse proxy
+      ansible.builtin.file:
+        src: /etc/nginx/sites-available/reverse_proxy
+        dest: /etc/nginx/sites-enabled/reverse_proxy
+        state: link
+
+    - name: Remove default NGINX site
+      ansible.builtin.file:
+        path: /etc/nginx/sites-enabled/default
+        state: absent
+      notify: restart nginx
+
+    - name: Create backup directories
+      file:
+        path: "{{ backup_path }}/{{ item }}"
+        state: directory
+      loop:
+        - portainer
+        - heimdall
+        - wordpress
+
+    - name: Set up cron jobs for automatic backups
+      cron:
+        name: "Backup {{ item }}"
+        minute: "0"
+        hour: "3"
+        job: "docker run --rm -v {{ item }}_data:/data -v {{ backup_path }}/{{ item }}:/backup alpine tar czf /backup/{{ item }}-backup-$(date +\\%Y\\%m\\%d).tar.gz /data"
+      loop:
+        - portainer
+        - heimdall
+        - wordpress
+
+  handlers:
+    - name: restart nginx
+      ansible.builtin.service:
+        name: nginx
+        state: restarted
+
+  volumes:
+    heimdall_data:
+    wordpress_data:
+    wordpress_db_data:
